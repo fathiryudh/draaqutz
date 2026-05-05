@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  background: #fbf8f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 12% 8%, rgba(180, 106, 60, 0.16), transparent 26rem),
+    radial-gradient(circle at 88% 18%, rgba(17, 16, 14, 0.08), transparent 24rem),
+    #fbf8f2;
+  color: #1b1916;
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 30;
+  content: "";
+  opacity: 0.035;
+  background-image:
+    linear-gradient(rgba(17, 16, 14, 0.8) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(17, 16, 14, 0.8) 1px, transparent 1px);
+  background-size: 42px 42px;
+}
+
+::selection {
+  background: #b46a3c;
+  color: #fbf8f2;
+}
+
+.reveal {
+  animation: reveal-up 900ms cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+
+@keyframes reveal-up {
+  from {
+    opacity: 0;
+    transform: translateY(32px);
+    filter: blur(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    animation: none;
+  }
+}
