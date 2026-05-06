@@ -1,6 +1,12 @@
-import type { InlineKeyboardMarkup } from "./types";
+import type { InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove } from "./types";
 
 type SendOptions = {
+  reply_markup?: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove;
+  parse_mode?: "HTML";
+  disable_web_page_preview?: boolean;
+};
+
+type EditOptions = {
   reply_markup?: InlineKeyboardMarkup;
   parse_mode?: "HTML";
   disable_web_page_preview?: boolean;
@@ -31,7 +37,9 @@ async function telegramRequest<T>(
   const data = (await response.json()) as T & { ok?: boolean; description?: string };
 
   if (!response.ok || data.ok === false) {
-    throw new Error(data.description ?? `Telegram ${method} failed.`);
+    const error = new Error(data.description ?? `Telegram ${method} failed.`);
+    error.name = "TelegramApiError";
+    throw error;
   }
 
   return data;
@@ -53,7 +61,7 @@ export async function editMessageText(
   chatId: number | string,
   messageId: number,
   text: string,
-  options: SendOptions = {}
+  options: EditOptions = {}
 ) {
   return telegramRequest("editMessageText", {
     chat_id: chatId,
@@ -67,5 +75,12 @@ export async function answerCallbackQuery(callbackQueryId: string, text?: string
   return telegramRequest("answerCallbackQuery", {
     callback_query_id: callbackQueryId,
     text
+  });
+}
+
+export async function setMyCommands(commands: Array<{ command: string; description: string }>, scope?: { type: string; user_id?: number }) {
+  return telegramRequest("setMyCommands", {
+    commands,
+    ...(scope && { scope })
   });
 }

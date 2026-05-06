@@ -33,3 +33,13 @@ export type TelegramUpdate = {
 export type InlineKeyboardMarkup = {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
 };
+
+export type ReplyKeyboardMarkup = {
+  keyboard: Array<Array<{ text: string }>>;
+  resize_keyboard?: boolean;
+  one_time_keyboard?: boolean;
+};
+
+export type ReplyKeyboardRemove = {
+  remove_keyboard: true;
+};

@@ -135,7 +135,7 @@ export function GooeyText({
           ref={text1Ref}
           aria-hidden="true"
           className={cn(
-            "absolute inline-block w-full max-w-[min(100%,11ch)] select-none text-center text-4xl font-semibold leading-none tracking-tight text-charcoal sm:text-5xl md:text-6xl",
+            "absolute inline-block w-full max-w-[min(100%,12ch)] select-none text-balance text-center text-4xl font-black leading-[0.9] tracking-normal text-charcoal sm:text-5xl md:text-6xl",
             textClassName
           )}
         />
@@ -143,7 +143,7 @@ export function GooeyText({
           ref={text2Ref}
           aria-hidden="true"
           className={cn(
-            "absolute inline-block w-full max-w-[min(100%,11ch)] select-none text-center text-4xl font-semibold leading-none tracking-tight text-charcoal sm:text-5xl md:text-6xl",
+            "absolute inline-block w-full max-w-[min(100%,12ch)] select-none text-balance text-center text-4xl font-black leading-[0.9] tracking-normal text-charcoal sm:text-5xl md:text-6xl",
             textClassName
           )}
         />

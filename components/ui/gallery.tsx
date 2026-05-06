@@ -23,13 +23,6 @@ const positions = {
     { x: "0px", y: "8px", zIndex: 30 },
     { x: "160px", y: "22px", zIndex: 20 },
     { x: "320px", y: "44px", zIndex: 10 }
-  ],
-  mobile: [
-    { x: "-92px", y: "16px", zIndex: 50 },
-    { x: "-46px", y: "34px", zIndex: 40 },
-    { x: "0px", y: "8px", zIndex: 30 },
-    { x: "46px", y: "28px", zIndex: 20 },
-    { x: "92px", y: "44px", zIndex: 10 }
   ]
 };
 
@@ -42,15 +35,6 @@ export function PhotoGallery({
 }) {
   const [isVisible, setIsVisible] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
-  const [isMobile, setIsMobile] = useState(false);
-
-  useEffect(() => {
-    const media = window.matchMedia("(max-width: 767px)");
-    const sync = () => setIsMobile(media.matches);
-    sync();
-    media.addEventListener("change", sync);
-    return () => media.removeEventListener("change", sync);
-  }, []);
 
   useEffect(() => {
     const visibilityTimer = setTimeout(() => setIsVisible(true), animationDelay * 1000);
@@ -62,11 +46,11 @@ export function PhotoGallery({
     };
   }, [animationDelay]);
 
-  const activePositions = isMobile ? positions.mobile : positions.desktop;
-  const activePhotos = photos.slice(0, 5).map((photo, index) => ({
+  const mobilePhotos = photos.slice(0, 5);
+  const activePhotos = mobilePhotos.map((photo, index) => ({
     ...photo,
     order: index,
-    ...activePositions[index]
+    ...positions.desktop[index]
   }));
 
   const containerVariants: Variants = {
@@ -109,12 +93,33 @@ export function PhotoGallery({
         <p className="text-xs font-semibold uppercase tracking-[0.24em] text-copper">
           Recent cuts
         </p>
-        <h2 className="mx-auto mt-4 max-w-3xl text-4xl font-semibold leading-none tracking-tight text-charcoal md:text-6xl">
+        <h2 className="mx-auto mt-4 max-w-3xl text-4xl font-extrabold leading-none tracking-normal text-charcoal md:text-6xl">
           A closer look at the work.
         </h2>
       </div>
 
-      <div className="relative mb-8 mt-8 h-[350px] w-full items-center justify-center md:mt-12 lg:flex">
+      <motion.div
+        className="-mx-4 mt-10 flex snap-x snap-mandatory gap-4 overflow-x-auto overscroll-x-contain px-4 pb-6 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:hidden"
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: isVisible ? 1 : 0, y: isVisible ? 0 : 12 }}
+        transition={{ duration: 0.4, ease: "easeOut" }}
+      >
+        {mobilePhotos.map((photo) => (
+          <div key={photo.id} className="snap-center first:pl-2 last:pr-2">
+            <Photo
+              width={250}
+              height={250}
+              src={photo.src}
+              alt={photo.alt}
+              direction={photo.direction}
+              rotationSeed={photo.id}
+              interactive={false}
+            />
+          </div>
+        ))}
+      </motion.div>
+
+      <div className="relative mb-8 mt-12 hidden h-[350px] w-full items-center justify-center md:block lg:flex">
         <motion.div
           className="relative mx-auto flex w-full max-w-7xl justify-center"
           initial={{ opacity: 0 }}
@@ -174,6 +179,7 @@ export function Photo({
   rotationSeed,
   width,
   height,
+  interactive = true,
   ...props
 }: {
   src: StaticImageData;
@@ -183,6 +189,7 @@ export function Photo({
   rotationSeed: number;
   width: number;
   height: number;
+  interactive?: boolean;
 }) {
   const rotation = (1 + (rotationSeed % 3)) * (direction === "left" ? -1 : 1);
   const x = useMotionValue(200);
@@ -201,18 +208,26 @@ export function Photo({
 
   return (
     <motion.div
-      drag
+      drag={interactive}
       dragConstraints={{ left: 0, right: 0, top: 0, bottom: 0 }}
-      whileTap={{ scale: 1.16, zIndex: 9999 }}
-      whileHover={{
-        scale: 1.08,
-        rotateZ: 2 * (direction === "left" ? -1 : 1),
-        zIndex: 9999
-      }}
-      whileDrag={{
-        scale: 1.08,
-        zIndex: 9999
-      }}
+      whileTap={interactive ? { scale: 1.16, zIndex: 9999 } : { scale: 0.98 }}
+      whileHover={
+        interactive
+          ? {
+              scale: 1.08,
+              rotateZ: 2 * (direction === "left" ? -1 : 1),
+              zIndex: 9999
+            }
+          : undefined
+      }
+      whileDrag={
+        interactive
+          ? {
+              scale: 1.08,
+              zIndex: 9999
+            }
+          : undefined
+      }
       initial={{ rotate: 0 }}
       animate={{ rotate: rotation }}
       style={{
@@ -223,9 +238,13 @@ export function Photo({
         WebkitTouchCallout: "none",
         WebkitUserSelect: "none",
         userSelect: "none",
-        touchAction: "none"
+        touchAction: interactive ? "none" : "pan-x"
       }}
-      className={cn(className, "relative mx-auto shrink-0 cursor-grab active:cursor-grabbing")}
+      className={cn(
+        className,
+        "relative mx-auto shrink-0",
+        interactive ? "cursor-grab active:cursor-grabbing" : "cursor-default"
+      )}
       onMouseMove={handleMouse}
       onMouseLeave={resetMouse}
       draggable={false}
@@ -237,7 +256,7 @@ export function Photo({
           fill
           src={src}
           alt={alt}
-          sizes="220px"
+          sizes={`${width}px`}
           {...props}
           draggable={false}
         />
