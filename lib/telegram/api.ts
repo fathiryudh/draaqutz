@@ -78,6 +78,19 @@ export async function answerCallbackQuery(callbackQueryId: string, text?: string
   });
 }
 
+export async function getChatMember(chatId: number | string, userId: number) {
+  return telegramRequest<{
+    ok: true;
+    result: {
+      status: "creator" | "administrator" | "member" | "restricted" | "left" | "kicked";
+      is_member?: boolean;
+    };
+  }>("getChatMember", {
+    chat_id: chatId,
+    user_id: userId
+  });
+}
+
 export async function setMyCommands(commands: Array<{ command: string; description: string }>, scope?: { type: string; user_id?: number }) {
   return telegramRequest("setMyCommands", {
     commands,

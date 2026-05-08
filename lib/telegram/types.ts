@@ -31,7 +31,7 @@ export type TelegramUpdate = {
 };
 
 export type InlineKeyboardMarkup = {
-  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  inline_keyboard: Array<Array<{ text: string; callback_data: string } | { text: string; url: string }>>;
 };
 
 export type ReplyKeyboardMarkup = {

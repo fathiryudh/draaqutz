@@ -6,8 +6,11 @@ coverage
 *.tsbuildinfo
 .env
 .env*.local
+*service-account*.json
+draaqutz-booking-bot-*.json
 .DS_Store
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.vercel

@@ -2,7 +2,6 @@ import {
   ArrowUpRight,
   CalendarCheck,
   CheckCircle,
-  Drop,
   Medal,
   TelegramLogo,
 } from "@phosphor-icons/react/dist/ssr";
@@ -148,16 +147,43 @@ export default function Home() {
           </Shell>
 
           <Shell>
-            <div className="flex h-full flex-col justify-between p-7 md:p-10">
-              <Drop size={32} weight="light" className="text-copper" />
-              <div>
-                <h3 className="mt-20 text-3xl font-extrabold tracking-normal text-charcoal">
-                  Sea salt spray
-                </h3>
-                <p className="mt-4 font-medium leading-7 text-charcoal/64">
-                  Styling support for a clean, textured finish after the cut.
-                </p>
+            <div className="warn-float flex h-full flex-col justify-between p-4 md:p-5">
+              <div className="warn-frame relative overflow-hidden rounded-[1.5rem] border border-charcoal/12 bg-paper p-3 md:p-4">
+                <div className="warn-board relative overflow-hidden rounded-[1.2rem] border border-charcoal/10 bg-[#fcfaf5]">
+                  <div className="warn-sweep" aria-hidden="true" />
+                  <div className="warn-stripe" aria-hidden="true" />
+                  <div className="warn-ribbon" aria-hidden="true" />
+                  <div className="relative flex flex-col items-center px-5 py-8 text-center md:px-8 md:py-12">
+                    <div className="warn-sign-stage" aria-hidden="true">
+                      <div className="warn-sign-3d">
+                        <div className="warn-sign-face warn-sign-front">
+                          <span className="warn-exclaim">!</span>
+                        </div>
+                        <div className="warn-sign-face warn-sign-back">
+                          <span className="warn-exclaim warn-exclaim--back">!</span>
+                        </div>
+                      </div>
+                    </div>
+                    <p className="warn-chip mt-5 w-max rounded-full border border-charcoal/12 bg-charcoal px-3 py-1 text-[10px] font-black uppercase tracking-[0.24em] text-bone">
+                      Coming soon
+                    </p>
+                    <h3
+                      className="warn-glitch mt-5 max-w-md text-3xl font-extrabold leading-[0.95] tracking-normal text-charcoal md:text-5xl"
+                      data-text="Something is coming your way"
+                    >
+                      Something is coming your way
+                    </h3>
+                    <p className="mt-4 max-w-sm text-[15px] font-medium leading-7 text-charcoal/55">
+                      A new chapter is being written quietly in the background. The reveal is still locked away.
+                    </p>
+                  </div>
+                  <div className="warn-ribbon" aria-hidden="true" />
+                  <div className="warn-stripe" aria-hidden="true" />
+                </div>
               </div>
+              <p className="mt-6 border-t border-charcoal/10 pt-5 text-sm font-semibold leading-6 text-charcoal/50">
+                The channel will surface it first when it is ready.
+              </p>
             </div>
           </Shell>
         </div>
