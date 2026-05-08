@@ -7,9 +7,13 @@ import {
   type CompletedBookingSlot,
   type CustomerCancelledBooking,
   type DatabaseBooking,
-  type DatabaseSlot
+  type DatabaseCustomer,
+  type DatabaseSlot,
+  type PendingBooking,
+  type SlotDeleteDraft
 } from "@/lib/supabase/admin";
-import { answerCallbackQuery, editMessageText, sendMessage, setMyCommands } from "./api";
+import { createGoogleBookingEvent, deleteGoogleBookingEvent } from "@/lib/calendar/google";
+import { answerCallbackQuery, editMessageText, getChatMember, sendMessage, setMyCommands } from "./api";
 import type { InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, TelegramCallbackQuery, TelegramMessage, TelegramUpdate, TelegramUser } from "./types";
 
 type SlotInsert = {
@@ -26,6 +30,8 @@ type DraftSource = "new_slot" | "manual_refresh";
 
 const TELEGRAM_MESSAGE_LIMIT = 4096;
 const DRAFT_TTL_MINUTES = 30;
+const PENDING_BOOKING_TTL_MINUTES = 10;
+const BOOKING_ADDRESS = "Pasir Ris Dr 6 Blk 451, Lift A level 4";
 
 const TIME_SLOTS = [
   { label: "9 AM", value: "09:00:00", bit: 0 },
@@ -59,6 +65,10 @@ const ADMIN_COMMANDS = [
   { command: "newslot", description: "Add new slot(s)" },
   { command: "slots", description: "View and manage slots" },
   { command: "post", description: "Post new date schedules" },
+  { command: "book", description: "Book a customer slot" },
+  { command: "mybooking", description: "View your current booking" },
+  { command: "cancel", description: "Cancel your booking" },
+  { command: "loyalty", description: "View loyalty stamps" },
   { command: "start", description: "View available dates" },
   { command: "help", description: "Show help" }
 ];
@@ -187,7 +197,25 @@ function truncateLabel(value: string, maxLength = 48) {
 }
 
 function isCommandOrKnownButton(text: string, command: string) {
-  return Boolean(command) || ["➕ New Slot", "📋 View Slots", "📢 Post", "❓ Help"].includes(text);
+  return command.startsWith("/") || [
+    "➕ New Slot",
+    "📋 View Slots",
+    "📢 Post",
+    "📅 Book Slot",
+    "🧾 My Booking",
+    "✕ Cancel Booking",
+    "⭐ Loyalty",
+    "❓ Help"
+  ].includes(text);
+}
+
+function bookingCustomerName(typedName: string) {
+  return typedName.replace(/\s+/g, " ").trim();
+}
+
+function adminBookingLabel(booking: DatabaseBooking) {
+  const username = booking.customer_username ? ` (@${booking.customer_username})` : "";
+  return `${booking.customer_name}${username}`;
 }
 
 function hashText(text: string) {
@@ -238,14 +266,159 @@ function getNextDays(count: number): string[] {
 
 async function upsertCustomer(user: TelegramUser) {
   const supabase = getSupabaseAdmin();
-  await supabase.from("customers").upsert(
+  const { error } = await supabase.from("customers").upsert(
     {
       telegram_id: user.id,
       username: user.username ?? null,
-      display_name: displayName(user)
+      display_name: displayName(user),
+      updated_at: new Date().toISOString()
     },
     { onConflict: "telegram_id" }
   );
+  if (error) throw error;
+}
+
+async function getCustomer(telegramId: number) {
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("customers")
+    .select("*")
+    .eq("telegram_id", telegramId)
+    .maybeSingle<DatabaseCustomer>();
+
+  if (error) throw error;
+  return data;
+}
+
+function isJoinedChannelMember(member: Awaited<ReturnType<typeof getChatMember>>["result"]) {
+  if (["creator", "administrator", "member"].includes(member.status)) return true;
+  return member.status === "restricted" && member.is_member === true;
+}
+
+function channelJoinKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "Join Channel", url: process.env.TELEGRAM_CHANNEL_URL || "https://t.me/draaqutz" }],
+      [{ text: "I've Joined", callback_data: "vc" }]
+    ]
+  };
+}
+
+function channelUsernameFromUrl() {
+  const value = process.env.TELEGRAM_CHANNEL_URL || "https://t.me/draaqutz";
+  const match = value.match(/t\.me\/([A-Za-z0-9_]+)/i);
+  return match?.[1] ? `@${match[1]}` : null;
+}
+
+function channelIdsToVerify() {
+  const ids = [
+    process.env.TELEGRAM_CHANNEL_ID,
+    channelUsernameFromUrl()
+  ].filter((value): value is string => Boolean(value));
+
+  return Array.from(new Set(ids));
+}
+
+async function promptJoinChannel(chatId: number) {
+  await reply(chatId, "Join the Draaqutz Telegram channel first, then tap I've Joined so I can verify it.", channelJoinKeyboard());
+}
+
+async function editJoinChannelPrompt(callback: TelegramCallbackQuery, warning?: string) {
+  const text = [
+    warning,
+    "Join the Draaqutz Telegram channel first, then tap I've Joined so I can verify it."
+  ].filter(Boolean).join("\n\n");
+  await editInlineReply(callback, text, channelJoinKeyboard());
+}
+
+async function showChannelVerificationSetupError(chatId: number, detail?: string) {
+  const lines = [
+    "Booking is temporarily unavailable because channel membership verification is not set up.",
+    "Ask Draaqutz admin to set TELEGRAM_CHANNEL_ID and make sure the bot can inspect the channel."
+  ];
+  if (detail) lines.push(`Telegram error: ${detail}`);
+  await showCustomerKeyboard(chatId, lines.join("\n"));
+}
+
+async function editChannelVerificationSetupError(callback: TelegramCallbackQuery, detail?: string) {
+  const lines = [
+    "Booking is temporarily unavailable because channel membership verification is not set up.",
+    "Ask Draaqutz admin to set TELEGRAM_CHANNEL_ID and make sure the bot can inspect the channel."
+  ];
+  if (detail) lines.push(`Telegram error: ${detail}`);
+  await editInlineText(callback, lines.join("\n"));
+}
+
+async function verifyCustomerChannelMembership(user: TelegramUser) {
+  const customer = await getCustomer(user.id);
+  if (customer?.channel_membership_verified) return { ok: true as const };
+
+  const channelIds = channelIdsToVerify();
+  if (!channelIds.length) return { ok: false as const, reason: "setup" as const };
+
+  const failedChecks: string[] = [];
+  let sawMembershipStatus = false;
+
+  for (const channelId of channelIds) {
+    try {
+      const member = await getChatMember(channelId, user.id);
+      sawMembershipStatus = true;
+      if (isJoinedChannelMember(member.result)) {
+        const verifiedAt = new Date().toISOString();
+        const { error } = await getSupabaseAdmin()
+          .from("customers")
+          .update({
+            channel_membership_verified: true,
+            channel_membership_verified_at: verifiedAt,
+            updated_at: verifiedAt
+          })
+          .eq("telegram_id", user.id);
+
+        if (error) throw error;
+        return { ok: true as const };
+      }
+
+      failedChecks.push(`${channelId}: ${member.result.status}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      failedChecks.push(`${channelId}: ${detail}`);
+    }
+  }
+
+  return {
+    ok: false as const,
+    reason: sawMembershipStatus ? "join" as const : "setup" as const,
+    detail: failedChecks.join("; ")
+  };
+}
+
+async function ensureCustomerCanBookFromMessage(message: TelegramMessage, user: TelegramUser) {
+  const result = await verifyCustomerChannelMembership(user);
+  if (result.ok) return true;
+
+  if (result.reason === "join") {
+    await promptJoinChannel(message.chat.id);
+    return false;
+  }
+
+  await showChannelVerificationSetupError(message.chat.id, result.detail);
+  return false;
+}
+
+async function ensureCustomerCanBookFromCallback(callback: TelegramCallbackQuery) {
+  const chatId = callback.message?.chat.id;
+  if (!chatId) return false;
+
+  const result = await verifyCustomerChannelMembership(callback.from);
+  if (result.ok) return true;
+
+  if (result.reason === "join") {
+    await editJoinChannelPrompt(callback);
+    return false;
+  }
+
+  await editChannelVerificationSetupError(callback, result.detail);
+  return false;
 }
 
 async function reply(chatId: number, text: string, replyMarkup?: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove) {
@@ -282,7 +455,10 @@ function getAdminKeyboard(): ReplyKeyboardMarkup {
   return {
     keyboard: [
       [{ text: "➕ New Slot" }, { text: "📋 View Slots" }],
-      [{ text: "📢 Post" }, { text: "❓ Help" }]
+      [{ text: "📢 Post" }, { text: "📅 Book Slot" }],
+      [{ text: "🧾 My Booking" }, { text: "✕ Cancel Booking" }],
+      [{ text: "⭐ Loyalty" }],
+      [{ text: "❓ Help" }]
     ],
     resize_keyboard: true
   };
@@ -307,6 +483,15 @@ async function showCustomerKeyboard(chatId: number, text: string) {
   await reply(chatId, text, getCustomerKeyboard());
 }
 
+async function showBookingKeyboard(message: TelegramMessage, text: string) {
+  if (isAdmin(message.from)) {
+    await showAdminKeyboard(message.chat.id, text);
+    return;
+  }
+
+  await showCustomerKeyboard(message.chat.id, text);
+}
+
 async function listAvailableDates(chatId: number) {
   const supabase = getSupabaseAdmin();
   const { data, error } = await supabase
@@ -328,6 +513,24 @@ async function listAvailableDates(chatId: number) {
   await reply(chatId, "Choose a date:", {
     inline_keyboard: dates.map((date) => [{ text: dateButtonLabel(date), callback_data: `date:${date}` }])
   });
+}
+
+async function startCustomerBooking(message: TelegramMessage) {
+  const user = message.from;
+  if (!user) return;
+
+  await upsertCustomer(user);
+  if (!isAdmin(user)) {
+    const allowed = await ensureCustomerCanBookFromMessage(message, user);
+    if (!allowed) return;
+  }
+
+  if (isAdmin(user)) {
+    await showAdminKeyboard(message.chat.id, "Admin customer booking");
+  } else {
+    await showCustomerKeyboard(message.chat.id, "Customer menu");
+  }
+  await listAvailableDates(message.chat.id);
 }
 
 async function showCustomerDates(callback: TelegramCallbackQuery) {
@@ -354,6 +557,20 @@ async function showCustomerDates(callback: TelegramCallbackQuery) {
   await editInlineReply(callback, "Choose a date:", {
     inline_keyboard: dates.map((date) => [{ text: dateButtonLabel(date), callback_data: `date:${date}` }])
   });
+}
+
+async function retryChannelVerification(callback: TelegramCallbackQuery) {
+  await upsertCustomer(callback.from);
+  const result = await verifyCustomerChannelMembership(callback.from);
+  if (result.ok) {
+    return showCustomerDates(callback);
+  }
+
+  if (result.reason === "join") {
+    return editJoinChannelPrompt(callback, "I still cannot verify that you joined the channel.");
+  }
+
+  return editChannelVerificationSetupError(callback, result.detail);
 }
 
 async function listSlotsForDate(callback: TelegramCallbackQuery, date: string) {
@@ -401,6 +618,11 @@ async function bookSlot(callback: TelegramCallbackQuery, slotId: string) {
 
   await upsertCustomer(user);
 
+  if (!isAdmin(user)) {
+    const allowed = await ensureCustomerCanBookFromCallback(callback);
+    if (!allowed) return;
+  }
+
   const supabase = getSupabaseAdmin();
   const { data: slot, error: slotError } = await supabase
     .from("slots")
@@ -439,9 +661,112 @@ async function bookSlot(callback: TelegramCallbackQuery, slotId: string) {
     return;
   }
 
+  await setPendingBooking(user.id, chatId, slot.id);
+  await editInlineText(callback, `What name should I put for this booking?\n\nSlot: ${slotLabel(slot)}`);
+}
+
+async function setPendingBooking(customerTelegramId: number, chatId: number, slotId: string) {
+  const expiresAt = new Date(Date.now() + PENDING_BOOKING_TTL_MINUTES * 60 * 1000).toISOString();
+  const { error } = await getSupabaseAdmin().from("pending_bookings").upsert(
+    {
+      customer_telegram_id: customerTelegramId,
+      slot_id: slotId,
+      chat_id: chatId,
+      expires_at: expiresAt,
+      updated_at: new Date().toISOString()
+    },
+    { onConflict: "customer_telegram_id" }
+  );
+  if (error) throw error;
+}
+
+async function getPendingBooking(customerTelegramId: number, chatId: number) {
+  const { data, error } = await getSupabaseAdmin()
+    .from("pending_bookings")
+    .select("*")
+    .eq("customer_telegram_id", customerTelegramId)
+    .eq("chat_id", chatId)
+    .maybeSingle<PendingBooking>();
+
+  if (error) throw error;
+  return data;
+}
+
+async function clearPendingBooking(customerTelegramId: number) {
+  const { error } = await getSupabaseAdmin()
+    .from("pending_bookings")
+    .delete()
+    .eq("customer_telegram_id", customerTelegramId);
+
+  if (error) throw error;
+}
+
+async function handlePendingBookingName(message: TelegramMessage, pending: PendingBooking) {
+  const user = message.from;
+  if (!user) return;
+
+  const text = message.text?.replace(/\s+/g, " ").trim() ?? "";
+  const command = text.split(/\s+/)[0]?.split("@")[0].toLowerCase();
+  if (!text || isCommandOrKnownButton(text, command)) {
+    await reply(message.chat.id, "Send the booking name only, or send /book to start again.");
+    return;
+  }
+
+  if (text.length > 80) {
+    await reply(message.chat.id, "Use a shorter booking name, up to 80 characters.");
+    return;
+  }
+
+  if (new Date(pending.expires_at).getTime() <= Date.now()) {
+    await clearPendingBooking(user.id);
+    await showBookingKeyboard(message, "That booking session expired. Send /book to start again.");
+    return;
+  }
+
+  if (!isAdmin(user)) {
+    const allowed = await ensureCustomerCanBookFromMessage(message, user);
+    if (!allowed) {
+      await clearPendingBooking(user.id);
+      return;
+    }
+  }
+
+  const supabase = getSupabaseAdmin();
+  const { data: slot, error: slotError } = await supabase
+    .from("slots")
+    .select("*")
+    .eq("id", pending.slot_id)
+    .maybeSingle<DatabaseSlot>();
+
+  if (slotError) throw slotError;
+
+  if (!slot || slot.status !== "open") {
+    await clearPendingBooking(user.id);
+    await showBookingKeyboard(message, "That slot is no longer available. Send /book to choose another slot.");
+    return;
+  }
+
+  const { data: activeBooking, error: activeBookingError } = await supabase
+    .from("bookings")
+    .select("*, slots(*)")
+    .eq("customer_telegram_id", user.id)
+    .eq("status", "booked")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<DatabaseBooking & { slots: DatabaseSlot }>();
+
+  if (activeBookingError) throw activeBookingError;
+
+  if (activeBooking) {
+    await clearPendingBooking(user.id);
+    const activeSlot = slotLabel(activeBooking.slots);
+    await showBookingKeyboard(message, `You already have an active booking: ${activeSlot}. Use /cancel before booking another slot.`);
+    return;
+  }
+
   const { data: claimedSlot, error: updateError } = await supabase
     .from("slots")
-    .update({ status: "booked" })
+    .update({ status: "booked", updated_at: new Date().toISOString() })
     .eq("id", slot.id)
     .eq("status", "open")
     .select("*")
@@ -450,24 +775,44 @@ async function bookSlot(callback: TelegramCallbackQuery, slotId: string) {
   if (updateError) throw updateError;
 
   if (!claimedSlot) {
-    await editInlineText(callback, "That slot was just taken. Send /book to choose another slot.");
+    await clearPendingBooking(user.id);
+    await showBookingKeyboard(message, "That slot was just taken. Send /book to choose another slot.");
     return;
   }
 
-  const { error: bookingError } = await supabase.from("bookings").insert({
+  const { data: booking, error: bookingError } = await supabase.from("bookings").insert({
     slot_id: claimedSlot.id,
     customer_telegram_id: user.id,
     customer_username: user.username ?? null,
-    customer_name: displayName(user),
+    customer_name: bookingCustomerName(text),
     status: "booked"
-  });
+  }).select("*").maybeSingle<DatabaseBooking>();
+
+  await clearPendingBooking(user.id);
 
   if (bookingError) {
     await supabase.from("slots").update({ status: "open" }).eq("id", claimedSlot.id).eq("status", "booked");
     throw bookingError;
   }
 
-  await editInlineText(callback, `Booked: ${slotLabel(claimedSlot)}. Use /cancel if you need to release it.`);
+  if (booking) {
+    try {
+      const calendarEventId = await createGoogleBookingEvent({ booking, slot: claimedSlot });
+      if (calendarEventId) {
+        await supabase
+          .from("bookings")
+          .update({ calendar_event_id: calendarEventId })
+          .eq("id", booking.id);
+      }
+    } catch (error) {
+      console.error("Failed to create Google Calendar event", error);
+    }
+  }
+
+  await showBookingKeyboard(
+    message,
+    `Booked: ${slotLabel(claimedSlot)}.\n\nAddress: ${BOOKING_ADDRESS}\n\nUse /cancel if you need to release it.`
+  );
   await refreshExistingChannelSchedule(claimedSlot.service_date);
 }
 
@@ -483,12 +828,13 @@ async function cancelCustomerBooking(message: TelegramMessage) {
   if (error) throw error;
 
   if (!booking) {
-    await showCustomerKeyboard(message.chat.id, "You do not have an active Draaqutz booking.");
+    await showBookingKeyboard(message, "You do not have an active Draaqutz booking.");
     return;
   }
 
+  await deleteBookingCalendarEvent(booking.calendar_event_id);
   await refreshExistingChannelSchedule(booking.service_date);
-  await showCustomerKeyboard(message.chat.id, `Cancelled. The slot is open again: ${slotLabelFromRpc(booking)}.`);
+  await showBookingKeyboard(message, `Cancelled. The slot is open again: ${slotLabelFromRpc(booking)}.`);
 }
 
 async function showCustomerBooking(message: TelegramMessage) {
@@ -507,26 +853,53 @@ async function showCustomerBooking(message: TelegramMessage) {
 
   if (error) throw error;
 
-  await showCustomerKeyboard(
-    message.chat.id,
+  await showBookingKeyboard(
+    message,
     booking ? `Your active booking: ${slotLabel(booking.slots)}.` : "You do not have an active Draaqutz booking."
   );
 }
 
-async function showLoyalty(message: TelegramMessage) {
+async function showLoyalty(message: TelegramMessage, admin = false) {
   const user = message.from;
   if (!user) return;
 
+  await upsertCustomer(user);
+
   const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
+  const { data: customer, error: customerError } = await supabase
     .from("customers")
     .select("loyalty_stamps")
     .eq("telegram_id", user.id)
     .maybeSingle<{ loyalty_stamps: number }>();
 
-  if (error) throw error;
+  if (customerError) throw customerError;
 
-  await showCustomerKeyboard(message.chat.id, `You have ${data?.loyalty_stamps ?? 0} Draaqutz loyalty stamp(s).`);
+  const { count, error: eventCountError } = await supabase
+    .from("loyalty_events")
+    .select("id", { count: "exact", head: true })
+    .eq("customer_telegram_id", user.id)
+    .eq("reason", "completed_booking");
+
+  if (eventCountError) throw eventCountError;
+
+  const stamps = count ?? customer?.loyalty_stamps ?? 0;
+
+  if (customer && customer.loyalty_stamps !== stamps) {
+    await supabase
+      .from("customers")
+      .update({ loyalty_stamps: stamps })
+      .eq("telegram_id", user.id);
+  }
+
+  const stampWord = stamps === 1 ? "stamp" : "stamps";
+  const text = [`Loyalty`, "", `You have ${stamps} Draaqutz loyalty ${stampWord}.`, "Each completed booking adds 1 stamp."].join("\n");
+
+  if (admin) {
+    await showAdminKeyboard(message.chat.id, text);
+    return;
+  }
+
+  await showCustomerKeyboard(message.chat.id, text);
 }
 
 async function startSlotCreation(chatId: number) {
@@ -695,10 +1068,10 @@ async function showPostDatePicker(chatId: number) {
     return;
   }
 
-  const dates = await unpostedScheduleDates();
+  const dates = await upcomingScheduleDates();
 
   if (!dates.length) {
-    await showAdminKeyboard(chatId, "No unposted dates with slots. Posted dates are hidden from this menu.");
+    await showAdminKeyboard(chatId, "No upcoming dates with slots. Create slots first with /newslot.");
     return;
   }
 
@@ -932,7 +1305,7 @@ async function showAdminSlotsForDate(callback: TelegramCallbackQuery, date: stri
 
   const buttons = (data as Array<DatabaseSlot & { bookings?: DatabaseBooking[] }>).map((slot) => {
     const activeBooking = slot.bookings?.find((booking) => booking.status === "booked");
-    const bookingName = activeBooking?.customer_name.toUpperCase() ?? "";
+    const bookingName = activeBooking ? adminBookingLabel(activeBooking).toUpperCase() : "";
     const statusText = activeBooking ? "✓" : "○";
     return [
       {
@@ -942,10 +1315,215 @@ async function showAdminSlotsForDate(callback: TelegramCallbackQuery, date: stri
     ];
   });
 
+  buttons.push([{ text: "Delete Slots", callback_data: `dx:s:${date}` }]);
   buttons.push([{ text: "← Back to Dates", callback_data: "ab" }]);
   buttons.push([{ text: "➕ Add Slot", callback_data: "ns:start" }]);
 
   await editInlineReply(callback, `Slots for ${dateButtonLabel(date)} (✓ booked, ○ open):`, { inline_keyboard: buttons });
+}
+
+async function startSlotDeleteSelection(callback: TelegramCallbackQuery, date: string) {
+  const chatId = callback.message?.chat.id;
+  if (!chatId) return;
+
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("slots")
+    .select("id")
+    .eq("service_date", date)
+    .in("status", ["open", "booked"])
+    .order("start_time", { ascending: true });
+
+  if (error) throw error;
+
+  const slotIds = (data ?? []).map((slot) => slot.id);
+  if (!slotIds.length) {
+    await editInlineReply(callback, `No deletable slots for ${dateButtonLabel(date)}.`, {
+      inline_keyboard: [[{ text: "← Back", callback_data: `ad:${date}` }]]
+    });
+    return;
+  }
+
+  await supabase
+    .from("slot_delete_drafts")
+    .delete()
+    .eq("admin_telegram_id", callback.from.id)
+    .eq("chat_id", chatId);
+
+  const expiresAt = new Date(Date.now() + DRAFT_TTL_MINUTES * 60 * 1000).toISOString();
+  const { data: draft, error: draftError } = await supabase
+    .from("slot_delete_drafts")
+    .insert({
+      admin_telegram_id: callback.from.id,
+      chat_id: chatId,
+      service_date: date,
+      slot_ids: slotIds,
+      selected_slot_ids: [],
+      expires_at: expiresAt
+    })
+    .select("*")
+    .single<SlotDeleteDraft>();
+
+  if (draftError) throw draftError;
+  await renderSlotDeleteSelection(callback, draft);
+}
+
+async function getSlotDeleteDraftForCallback(callback: TelegramCallbackQuery, draftId: string) {
+  const chatId = callback.message?.chat.id;
+  if (!chatId) return null;
+
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("slot_delete_drafts")
+    .select("*")
+    .eq("id", draftId)
+    .eq("admin_telegram_id", callback.from.id)
+    .eq("chat_id", chatId)
+    .gt("expires_at", new Date().toISOString())
+    .maybeSingle<SlotDeleteDraft>();
+
+  if (error) throw error;
+  return data;
+}
+
+async function fetchDeleteDraftSlots(draft: SlotDeleteDraft) {
+  if (!draft.slot_ids.length) {
+    return new Map<string, DatabaseSlot & { bookings?: DatabaseBooking[] }>();
+  }
+
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("slots")
+    .select("*, bookings(*)")
+    .in("id", draft.slot_ids)
+    .in("status", ["open", "booked"])
+    .order("start_time", { ascending: true });
+
+  if (error) throw error;
+  const byId = new Map(((data ?? []) as Array<DatabaseSlot & { bookings?: DatabaseBooking[] }>).map((slot) => [slot.id, slot]));
+  return byId;
+}
+
+async function renderSlotDeleteSelection(callback: TelegramCallbackQuery, draft: SlotDeleteDraft, warning?: string) {
+  const slotsById = await fetchDeleteDraftSlots(draft);
+  const selected = new Set(draft.selected_slot_ids);
+  const visibleSlots = draft.slot_ids
+    .map((id, index) => ({ slot: slotsById.get(id), index }))
+    .filter((item): item is { slot: DatabaseSlot & { bookings?: DatabaseBooking[] }; index: number } => Boolean(item.slot));
+  const visibleSelectedCount = visibleSlots.filter(({ slot }) => selected.has(slot.id)).length;
+  const rows = visibleSlots.map(({ slot, index }) => {
+    const activeBooking = slot.bookings?.find((booking) => booking.status === "booked");
+    const marker = selected.has(slot.id) ? "●" : "○";
+    const bookedText = activeBooking ? ` booked ${adminBookingLabel(activeBooking)}` : " open";
+    return [
+      {
+        text: truncateLabel(`${marker} ${formatTime(slot.start_time)}-${formatTime(slot.end_time)} ${bookedText}`),
+        callback_data: `dx:t:${draft.id}:${index}`
+      }
+    ];
+  });
+
+  rows.push([
+    { text: "✕ Cancel", callback_data: `dx:x:${draft.id}` },
+    { text: `Delete (${visibleSelectedCount})`, callback_data: `dx:c:${draft.id}` }
+  ]);
+  rows.push([{ text: "← Back", callback_data: `ad:${draft.service_date}` }]);
+
+  const selectedLabels = visibleSlots
+    .map(({ slot }) => slot)
+    .filter((slot) => selected.has(slot.id))
+    .map((slot) => `- ${formatTime(slot.start_time)}-${formatTime(slot.end_time)} ${slot.location}`);
+  const selectedText = selectedLabels.length ? `\n\nSelected:\n${selectedLabels.join("\n")}` : "\n\nTap slots to select one or more.";
+  const warningText = warning ? `\n\n${warning}` : "";
+
+  await editInlineReply(callback, `Delete slots for ${dateButtonLabel(draft.service_date)}${selectedText}${warningText}`, {
+    inline_keyboard: rows
+  });
+}
+
+async function toggleSlotDeleteSelection(callback: TelegramCallbackQuery, draftId: string, indexText: string) {
+  const draft = await getSlotDeleteDraftForCallback(callback, draftId);
+  if (!draft) {
+    await editInlineReply(callback, "This delete picker expired. Open /slots again.", {
+      inline_keyboard: [[{ text: "← Back to Dates", callback_data: "ab" }]]
+    });
+    return;
+  }
+
+  const index = Number(indexText);
+  if (!Number.isInteger(index) || index < 0 || index >= draft.slot_ids.length) {
+    await renderSlotDeleteSelection(callback, draft, "That slot button is invalid. Pick from the current list.");
+    return;
+  }
+
+  const slotId = draft.slot_ids[index];
+  const selected = new Set(draft.selected_slot_ids);
+  if (selected.has(slotId)) {
+    selected.delete(slotId);
+  } else {
+    selected.add(slotId);
+  }
+
+  const selectedSlotIds = draft.slot_ids.filter((id) => selected.has(id));
+  const supabase = getSupabaseAdmin();
+  const { data: updated, error } = await supabase
+    .from("slot_delete_drafts")
+    .update({ selected_slot_ids: selectedSlotIds, updated_at: new Date().toISOString() })
+    .eq("id", draft.id)
+    .select("*")
+    .single<SlotDeleteDraft>();
+
+  if (error) throw error;
+  await renderSlotDeleteSelection(callback, updated);
+}
+
+async function showSlotDeleteConfirm(callback: TelegramCallbackQuery, draftId: string) {
+  const draft = await getSlotDeleteDraftForCallback(callback, draftId);
+  if (!draft) {
+    await editInlineReply(callback, "This delete picker expired. Open /slots again.", {
+      inline_keyboard: [[{ text: "← Back to Dates", callback_data: "ab" }]]
+    });
+    return;
+  }
+
+  if (!draft.selected_slot_ids.length) {
+    await renderSlotDeleteSelection(callback, draft, "Select at least one slot first.");
+    return;
+  }
+
+  const slotsById = await fetchDeleteDraftSlots(draft);
+  const selected = draft.slot_ids
+    .map((id) => slotsById.get(id))
+    .filter((slot): slot is DatabaseSlot & { bookings?: DatabaseBooking[] } => Boolean(slot))
+    .filter((slot) => draft.selected_slot_ids.includes(slot.id));
+  if (!selected.length) {
+    await renderSlotDeleteSelection(callback, draft, "Those selected slots are no longer available to delete.");
+    return;
+  }
+
+  const bookedCount = selected.filter((slot) => slot.status === "booked" || slot.bookings?.some((booking) => booking.status === "booked")).length;
+  const rows = selected.map((slot) => `- ${formatTime(slot.start_time)}-${formatTime(slot.end_time)} ${slot.location}`);
+  const bookedText = bookedCount > 0 ? `\n\n${bookedCount} booked slot(s) will notify customers.` : "";
+
+  await editInlineReply(callback, `Delete ${selected.length} slot(s) for ${dateButtonLabel(draft.service_date)}?\n\n${rows.join("\n")}${bookedText}`, {
+    inline_keyboard: [
+      [{ text: "Confirm Delete", callback_data: `dx:y:${draft.id}` }],
+      [{ text: "← Back", callback_data: `dx:s:${draft.service_date}` }]
+    ]
+  });
+}
+
+async function cancelSlotDeleteSelection(callback: TelegramCallbackQuery, draftId: string) {
+  const draft = await getSlotDeleteDraftForCallback(callback, draftId);
+  const supabase = getSupabaseAdmin();
+  await supabase.from("slot_delete_drafts").delete().eq("id", draftId);
+
+  if (draft) {
+    await showAdminSlotsForDate(callback, draft.service_date);
+    return;
+  }
+
+  await editAdminSlotDates(callback);
 }
 
 async function showSlotActions(callback: TelegramCallbackQuery, slotId: string) {
@@ -969,7 +1547,7 @@ async function showSlotActions(callback: TelegramCallbackQuery, slotId: string) 
   }
 
   const activeBooking = slot.bookings?.find((b) => b.status === "booked");
-  const status = slot.status === "booked" && activeBooking ? `Booked by ${activeBooking.customer_name}` : "Open";
+  const status = slot.status === "booked" && activeBooking ? `Booked by ${adminBookingLabel(activeBooking)}` : "Open";
 
   const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
 
@@ -1007,15 +1585,15 @@ async function showSlotEditMenu(callback: TelegramCallbackQuery, slotId: string)
 
   const activeBooking = slot.bookings?.find((booking) => booking.status === "booked");
   const note = activeBooking
-    ? "Cancel Booking keeps this slot open. Cancel Slot removes the slot too. Both notify the customer."
-    : "This removes the slot from the schedule.";
+    ? "Cancel Booking keeps this slot open. Delete Slots removes selected slot(s) too. Both notify booked customers."
+    : "Delete Slots lets you remove one or more slots from this date.";
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
 
   if (activeBooking) {
     rows.push([{ text: "Cancel Booking", callback_data: `cb:${slot.id}` }]);
   }
 
-  rows.push([{ text: "Cancel Slot", callback_data: `cx:${slot.id}` }]);
+  rows.push([{ text: "Delete Slots", callback_data: `dx:s:${slot.service_date}` }]);
   rows.push([{ text: "← Back", callback_data: `as:${slot.id}:${slot.service_date}` }]);
 
   await editInlineReply(callback, `Edit slot\n${slotLabel(slot)}\n\n${note}`, {
@@ -1044,7 +1622,8 @@ async function completeSlotFromCallback(callback: TelegramCallbackQuery, slotId:
   await refreshExistingChannelSchedule(completed.service_date);
 
   const stampText = completed.loyalty_awarded ? "Added 1 loyalty stamp" : "Loyalty stamp was already awarded";
-  await editInlineReply(callback, `Completed: ${slotLabelFromRpc(completed)}\n${stampText} for ${completed.customer_name}.`, {
+  const completedLabel = completed.customer_username ? `${completed.customer_name} (@${completed.customer_username})` : completed.customer_name;
+  await editInlineReply(callback, `Completed: ${slotLabelFromRpc(completed)}\n${stampText} for ${completedLabel}.`, {
     inline_keyboard: [[{ text: "← Back to Slots", callback_data: `ad:${completed.service_date}` }]]
   });
 }
@@ -1063,6 +1642,7 @@ async function cancelSlotFromCallback(callback: TelegramCallbackQuery, slotId: s
   }
 
   if (result.cancelled_now) await refreshExistingChannelSchedule(result.service_date);
+  if (result.cancelled_now) await deleteBookingCalendarEvent(result.calendar_event_id);
 
   const dmText = result.customer_telegram_id
     ? await notifyAdminCancelledBooking(result)
@@ -1083,6 +1663,72 @@ async function cancelAdminSlotById(slotId: string) {
   return data;
 }
 
+async function cancelAdminSlotsByIds(slotIds: string[]) {
+  if (!slotIds.length) return [];
+
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .rpc("cancel_admin_slots_by_ids", { slot_ids_input: slotIds });
+
+  if (error) throw error;
+  return (data ?? []) as AdminCancelledSlot[];
+}
+
+async function deleteSelectedSlotsFromCallback(callback: TelegramCallbackQuery, draftId: string) {
+  const draft = await getSlotDeleteDraftForCallback(callback, draftId);
+  if (!draft) {
+    await editInlineReply(callback, "This delete picker expired. Open /slots again.", {
+      inline_keyboard: [[{ text: "← Back to Dates", callback_data: "ab" }]]
+    });
+    return;
+  }
+
+  if (!draft.selected_slot_ids.length) {
+    await renderSlotDeleteSelection(callback, draft, "Select at least one slot first.");
+    return;
+  }
+
+  const liveSlotsById = await fetchDeleteDraftSlots(draft);
+  const liveSelectedIds = draft.slot_ids
+    .filter((id) => draft.selected_slot_ids.includes(id))
+    .filter((id) => liveSlotsById.has(id));
+
+  if (!liveSelectedIds.length) {
+    await renderSlotDeleteSelection(callback, draft, "Those selected slots are no longer available to delete.");
+    return;
+  }
+
+  await editInlineText(callback, `Deleting ${liveSelectedIds.length} slot(s) for ${dateButtonLabel(draft.service_date)}...`);
+
+  const results = await cancelAdminSlotsByIds(liveSelectedIds);
+  const cancelled = results.filter((result) => result.cancelled_now);
+  const affectedDates = Array.from(new Set(cancelled.map((result) => result.service_date)));
+
+  await Promise.all(affectedDates.map((date) => refreshExistingChannelSchedule(date)));
+  await Promise.all(cancelled.map((result) => deleteBookingCalendarEvent(result.calendar_event_id)));
+  const notifyResults = await Promise.all(cancelled.map((result) => notifyAdminCancelledBooking(result)));
+
+  const supabase = getSupabaseAdmin();
+  await supabase.from("slot_delete_drafts").delete().eq("id", draft.id);
+
+  const notified = notifyResults.filter((text) => text === "Customer notified.").length;
+  const noNotificationNeeded = notifyResults.filter((text) => text === "No customer notification needed.").length;
+  const notificationFailures = notifyResults.filter((text) => text.startsWith("Customer notification failed"));
+  const skipped = liveSelectedIds.length - results.length;
+  const lines = [
+    `Deleted ${cancelled.length} slot(s) for ${dateButtonLabel(draft.service_date)}.`
+  ];
+
+  if (notified > 0) lines.push(`Customer notifications sent: ${notified}.`);
+  if (noNotificationNeeded > 0 && notified === 0 && !notificationFailures.length) lines.push("No customer notifications needed.");
+  if (notificationFailures.length) lines.push(`Notification failures: ${notificationFailures.length}.`);
+  if (skipped > 0) lines.push(`Skipped ${skipped} slot(s) that were already unavailable.`);
+
+  await editInlineReply(callback, lines.join("\n"), {
+    inline_keyboard: [[{ text: "← Back to Slots", callback_data: `ad:${draft.service_date}` }]]
+  });
+}
+
 async function cancelBookingFromCallback(callback: TelegramCallbackQuery, slotId: string) {
   const result = await cancelAdminBookingBySlotId(slotId);
 
@@ -1094,6 +1740,7 @@ async function cancelBookingFromCallback(callback: TelegramCallbackQuery, slotId
   }
 
   if (result.cancelled_now) await refreshExistingChannelSchedule(result.service_date);
+  if (result.cancelled_now) await deleteBookingCalendarEvent(result.calendar_event_id);
 
   const dmText = await notifyAdminCancelledBooking(result);
   await editInlineReply(callback, `Booking cancelled. Slot is open again: ${slotLabelFromRpc(result)}\n${dmText}`, {
@@ -1109,6 +1756,14 @@ async function cancelAdminBookingBySlotId(slotId: string) {
 
   if (error) throw error;
   return data;
+}
+
+async function deleteBookingCalendarEvent(calendarEventId: string | null | undefined) {
+  try {
+    await deleteGoogleBookingEvent(calendarEventId);
+  } catch (error) {
+    console.error("Failed to delete Google Calendar event", error);
+  }
 }
 
 async function notifyAdminCancelledBooking(slot: Pick<AdminCancelledSlot | AdminCancelledBooking, "customer_telegram_id" | "service_date" | "start_time" | "end_time" | "location">) {
@@ -1179,7 +1834,7 @@ async function showCancelBookingConfirm(callback: TelegramCallbackQuery, slotId:
     return;
   }
 
-  await editInlineReply(callback, `Cancel ${activeBooking.customer_name}'s booking?\n${slotLabel(slot)}\n\nThe slot will stay open and the customer will be notified.`, {
+  await editInlineReply(callback, `Cancel ${adminBookingLabel(activeBooking)}'s booking?\n${slotLabel(slot)}\n\nThe slot will stay open and the customer will be notified.`, {
     inline_keyboard: [
       [{ text: "Confirm", callback_data: `abk:${slot.id}` }],
       [{ text: "← Back", callback_data: `se:${slot.id}` }]
@@ -1217,31 +1872,46 @@ async function handleMessage(message: TelegramMessage) {
       }
     }
 
+    if (user) {
+      const pendingBooking = await getPendingBooking(user.id, message.chat.id);
+      if (pendingBooking) {
+        if (isCommandOrKnownButton(text, command)) {
+          await clearPendingBooking(user.id);
+        } else {
+          return handlePendingBookingName(message, pendingBooking);
+        }
+      }
+    }
+
     if (admin) {
       if (text === "➕ New Slot") return startSlotCreation(message.chat.id);
       if (text === "📋 View Slots") return showAdminSlots(message.chat.id);
       if (text === "📢 Post") {
         return showPostDatePicker(message.chat.id);
       }
+      if (text === "📅 Book Slot") return startCustomerBooking(message);
+      if (text === "🧾 My Booking") return showCustomerBooking(message);
+      if (text === "✕ Cancel Booking") return cancelCustomerBooking(message);
+      if (text === "⭐ Loyalty") return showLoyalty(message, true);
       if (text === "❓ Help") return showAdminKeyboard(message.chat.id, helpText);
     }
 
     if (!admin) {
-      if (text === "📅 Book Slot") return listAvailableDates(message.chat.id);
+      if (text === "📅 Book Slot") return startCustomerBooking(message);
       if (text === "🧾 My Booking") return showCustomerBooking(message);
       if (text === "✕ Cancel Booking") return cancelCustomerBooking(message);
       if (text === "⭐ Loyalty") return showLoyalty(message);
       if (text === "❓ Help") return showCustomerKeyboard(message.chat.id, helpText);
     }
 
-    if (command === "/start" || command === "/book") {
+    if (command === "/start") {
       if (admin) {
         if (user) await setupAdminCommands(user.id);
         return showAdminKeyboard(message.chat.id, "Welcome back, admin! Use the buttons below or /help for commands.");
       }
-      await showCustomerKeyboard(message.chat.id, "Customer menu");
-      return listAvailableDates(message.chat.id);
+      return startCustomerBooking(message);
     }
+    if (command === "/book") return startCustomerBooking(message);
     if (command === "/help") {
       if (admin) {
         return showAdminKeyboard(message.chat.id, helpText);
@@ -1249,7 +1919,7 @@ async function handleMessage(message: TelegramMessage) {
       return showCustomerKeyboard(message.chat.id, helpText);
     }
     if (command === "/mybooking") return showCustomerBooking(message);
-    if (command === "/loyalty") return showLoyalty(message);
+    if (command === "/loyalty") return showLoyalty(message, admin);
     if (command === "/cancel") return cancelCustomerBooking(message);
     if (command === "/newslot") {
       if (!admin) return showCustomerKeyboard(message.chat.id, "Only Draaqutz admins can create slots.");
@@ -1287,13 +1957,28 @@ async function handleCallback(callback: TelegramCallbackQuery) {
 
     await answerCallbackQuery(callback.id).catch(() => {});
 
+    // Customer: retry channel membership verification
+    if (data === "vc") {
+      return retryChannelVerification(callback);
+    }
+
     // Customer: date selection
     if (data.startsWith("date:")) {
+      if (!isAdmin(callback.from)) {
+        await upsertCustomer(callback.from);
+        const allowed = await ensureCustomerCanBookFromCallback(callback);
+        if (!allowed) return;
+      }
       return listSlotsForDate(callback, data.slice(5));
     }
 
     // Customer: back to available dates
     if (data === "cd") {
+      if (!isAdmin(callback.from)) {
+        await upsertCustomer(callback.from);
+        const allowed = await ensureCustomerCanBookFromCallback(callback);
+        if (!allowed) return;
+      }
       return showCustomerDates(callback);
     }
 
@@ -1389,14 +2074,38 @@ async function handleCallback(callback: TelegramCallbackQuery) {
       return showAdminSlotsForDate(callback, date);
     }
 
+    // Admin: delete slots - start selection for date
+    if (data.startsWith("dx:s:")) {
+      const date = data.slice(5);
+      if (!assertDate(date)) return editInlineText(callback, "This date is invalid. Please open /slots again.");
+      return startSlotDeleteSelection(callback, date);
+    }
+
+    // Admin: delete slots - toggle slot selection
+    if (data.startsWith("dx:t:")) {
+      const parts = data.slice(5).split(":");
+      return toggleSlotDeleteSelection(callback, parts[0], parts[1]);
+    }
+
+    // Admin: delete slots - confirmation screen
+    if (data.startsWith("dx:c:")) {
+      return showSlotDeleteConfirm(callback, data.slice(5));
+    }
+
+    // Admin: delete slots - cancel selection
+    if (data.startsWith("dx:x:")) {
+      return cancelSlotDeleteSelection(callback, data.slice(5));
+    }
+
+    // Admin: delete slots - execute cancellation
+    if (data.startsWith("dx:y:")) {
+      return deleteSelectedSlotsFromCallback(callback, data.slice(5));
+    }
+
     // Admin: choose date to post to channel
     if (data.startsWith("pd:")) {
       const date = data.slice(3);
       if (!assertDate(date)) return editInlineText(callback, "This date is invalid. Please open /post again.");
-      const unpostedDates = await unpostedScheduleDates();
-      if (!unpostedDates.includes(date)) {
-        return editInlineText(callback, "That date has already been posted. Posted dates are hidden from /post.");
-      }
       return createChannelPostDraft(chatId, callback.from.id, "manual_refresh", [date]);
     }
 
@@ -1500,32 +2209,36 @@ async function buildDraftText(dates: string[]) {
 }
 
 function formatScheduleForDate(date: string, slots: ScheduleSlot[]) {
+  const botUsername = process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME || "BookWithDraBot";
+
   if (!slots.length) {
     return [
-      `Draaqutz schedule for ${shortDate(date)}`,
+      `📅 Schedule for ${shortDate(date)}`,
       "",
-      "No open slots for this date right now. Please check /book for another date."
+      "No open slots for this date right now.",
+      "",
+      `💈 Text @${botUsername} to secure your slots!`
     ].join("\n");
   }
 
   const openCount = slots.filter((slot) => slot.status === "open").length;
   const header = openCount > 0
-    ? `Draaqutz schedule for ${shortDate(date)}`
-    : `Draaqutz schedule for ${shortDate(date)} - Fully booked`;
+    ? `📅 Schedule for ${shortDate(date)}`
+    : `📅 Schedule for ${shortDate(date)} – Fully booked`;
 
   const locationSections = Array.from(groupSlotsByLocation(slots).entries()).flatMap(([location, locationSlots]) => {
     const rows = locationSlots.map((slot) => {
       const activeBooking = slot.bookings?.find((booking) => booking.status === "booked");
-      const status = activeBooking || slot.status === "booked" ? "Booked" : "Open";
-      return `${formatTime(slot.start_time)} - ${formatTime(slot.end_time)} -> ${status}`;
+      const name = activeBooking?.customer_name.replace(/\s*\(@[^)]+\)$/, "") ?? "";
+      return `🕐 ${formatTime(slot.start_time)} – ${formatTime(slot.end_time)} → ${name}`;
     });
 
     return [`${location}:`, "", ...rows, ""];
   });
 
   const footer = openCount > 0
-    ? "Send /book to secure your slot."
-    : "This date is fully booked. If a slot reopens, this post will update.";
+    ? `💈 Text @${botUsername} to secure your slots!`
+    : `This date is fully booked. If a slot reopens, this post will update.\n\n💈 Text @${botUsername} to secure your slots!`;
 
   return [header, "", ...locationSections, footer].join("\n").trim();
 }
@@ -1545,17 +2258,13 @@ async function publishScheduleDate(date: string, textOverride?: string) {
   const postId = channelPostId(date);
   const { data: post, error } = await supabase
     .from("channel_posts")
-    .select("message_id, content_hash")
+    .select("message_id, content_hash, channel_id")
     .eq("id", postId)
-    .maybeSingle<{ message_id: number; content_hash: string | null }>();
+    .maybeSingle<{ message_id: number; content_hash: string | null; channel_id: string }>();
 
   if (error) throw error;
 
-  if (post?.message_id && post.content_hash === contentHash) {
-    return { status: "noop" as const };
-  }
-
-  if (post?.message_id) {
+  if (post?.message_id && post.channel_id === channelId) {
     try {
       await editMessageText(channelId, post.message_id, text);
       await supabase.from("channel_posts").upsert({
@@ -1567,13 +2276,15 @@ async function publishScheduleDate(date: string, textOverride?: string) {
         updated_at: new Date().toISOString()
       });
       return { status: "edited" as const };
-    } catch (error) {
-      if (isMessageNotModified(error)) {
+    } catch (editError) {
+      if (isMessageNotModified(editError)) {
         await supabase.from("channel_posts").update({ content_hash: contentHash, updated_at: new Date().toISOString() }).eq("id", postId);
         return { status: "noop" as const };
       }
       await supabase.from("channel_posts").delete().eq("id", postId);
     }
+  } else if (post) {
+    await supabase.from("channel_posts").delete().eq("id", postId);
   }
 
   const sent = await sendMessage(channelId, text);
@@ -1632,17 +2343,29 @@ async function handleChannelPostDraftCallback(callback: TelegramCallbackQuery, d
   }
 
   if (action === "p") {
-    const results = [];
+    const results: Array<{ date: string; status: string; error?: string }> = [];
     for (let i = 0; i < draft.service_dates.length; i += 1) {
       const date = draft.service_dates[i];
       const override = draft.edited && draft.service_dates.length === 1 ? draft.draft_text : undefined;
-      results.push(await publishScheduleDate(date, override));
+      try {
+        const result = await publishScheduleDate(date, override);
+        results.push({ date, status: result.status, ...("reason" in result ? { error: result.reason } : {}) });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : "Unknown error";
+        results.push({ date, status: "error", error: detail });
+      }
     }
     await supabase.from("channel_post_drafts").delete().eq("id", draft.id);
-    const sent = results.filter((result) => result.status === "sent").length;
-    const edited = results.filter((result) => result.status === "edited").length;
-    const noop = results.filter((result) => result.status === "noop").length;
-    await editInlineText(callback, `Posted channel schedule.\nSent: ${sent}. Edited: ${edited}. No change: ${noop}.`);
+    const sent = results.filter((r) => r.status === "sent").length;
+    const edited = results.filter((r) => r.status === "edited").length;
+    const noop = results.filter((r) => r.status === "noop").length;
+    const skipped = results.filter((r) => r.status === "skipped");
+    const errors = results.filter((r) => r.status === "error");
+    const lines = [`Posted channel schedule.\nSent: ${sent}. Edited: ${edited}. No change: ${noop}.`];
+    if (skipped.length) lines.push(`Skipped: ${skipped.length}. Reason: ${skipped.map((r) => r.error).join(", ")}`);
+    if (errors.length) lines.push(`Errors: ${errors.map((r) => `${shortDate(r.date)}: ${r.error}`).join("\n")}`);
+    lines.push(`\nChannel ID: ${process.env.TELEGRAM_CHANNEL_ID || "(not set)"}`);
+    await editInlineText(callback, lines.join("\n"));
   }
 }
 

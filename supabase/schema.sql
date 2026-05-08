@@ -5,9 +5,14 @@ create table if not exists public.customers (
   username text,
   display_name text not null,
   loyalty_stamps integer not null default 0,
+  channel_membership_verified boolean not null default false,
+  channel_membership_verified_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.customers add column if not exists channel_membership_verified boolean not null default false;
+alter table public.customers add column if not exists channel_membership_verified_at timestamptz;
 
 create table if not exists public.slots (
   id uuid primary key default gen_random_uuid(),
@@ -37,9 +42,12 @@ create table if not exists public.bookings (
   customer_username text,
   customer_name text not null,
   status text not null default 'booked' check (status in ('booked', 'cancelled', 'completed')),
+  calendar_event_id text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.bookings add column if not exists calendar_event_id text;
 
 create unique index if not exists one_active_booking_per_slot
   on public.bookings(slot_id)
@@ -48,6 +56,15 @@ create unique index if not exists one_active_booking_per_slot
 create unique index if not exists one_active_booking_per_customer
   on public.bookings(customer_telegram_id)
   where status = 'booked';
+
+create table if not exists public.pending_bookings (
+  customer_telegram_id bigint primary key references public.customers(telegram_id) on delete cascade,
+  slot_id uuid not null references public.slots(id) on delete cascade,
+  chat_id bigint not null,
+  expires_at timestamptz not null default now() + interval '10 minutes',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
 
 create table if not exists public.loyalty_events (
   id uuid primary key default gen_random_uuid(),
@@ -91,6 +108,18 @@ create unique index if not exists one_active_channel_post_draft_per_admin_chat
   on public.channel_post_drafts(admin_telegram_id, chat_id)
   where status in ('preview', 'editing');
 
+create table if not exists public.slot_delete_drafts (
+  id uuid primary key default gen_random_uuid(),
+  admin_telegram_id bigint not null,
+  chat_id bigint not null,
+  service_date date not null,
+  slot_ids uuid[] not null,
+  selected_slot_ids uuid[] not null default '{}',
+  expires_at timestamptz not null default now() + interval '30 minutes',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.pending_slots (
   chat_id bigint primary key,
   service_date date not null,
@@ -116,6 +145,7 @@ returns table (
   booking_id uuid,
   customer_telegram_id bigint,
   customer_name text,
+  customer_username text,
   service_date date,
   start_time time,
   end_time time,
@@ -185,6 +215,7 @@ begin
   booking_id := booking_record.id;
   customer_telegram_id := booking_record.customer_telegram_id;
   customer_name := booking_record.customer_name;
+  customer_username := booking_record.customer_username;
   service_date := slot_record.service_date;
   start_time := slot_record.start_time;
   end_time := slot_record.end_time;
@@ -201,6 +232,7 @@ returns table (
   start_time time,
   end_time time,
   location text,
+  calendar_event_id text,
   cancelled_now boolean
 )
 language plpgsql
@@ -245,6 +277,7 @@ begin
   start_time := slot_record.start_time;
   end_time := slot_record.end_time;
   location := slot_record.location;
+  calendar_event_id := booking_record.calendar_event_id;
   cancelled_now := true;
   return next;
 end;
@@ -260,6 +293,7 @@ returns table (
   start_time time,
   end_time time,
   location text,
+  calendar_event_id text,
   cancelled_now boolean
 )
 language plpgsql
@@ -310,6 +344,7 @@ begin
   start_time := slot_record.start_time;
   end_time := slot_record.end_time;
   location := slot_record.location;
+  calendar_event_id := booking_record.calendar_event_id;
   return next;
 end;
 $$;
@@ -324,6 +359,7 @@ returns table (
   start_time time,
   end_time time,
   location text,
+  calendar_event_id text,
   cancelled_now boolean
 )
 language plpgsql
@@ -374,6 +410,7 @@ begin
   start_time := slot_record.start_time;
   end_time := slot_record.end_time;
   location := slot_record.location;
+  calendar_event_id := booking_record.calendar_event_id;
   cancelled_now := true;
   return next;
 end;
@@ -389,6 +426,7 @@ returns table (
   start_time time,
   end_time time,
   location text,
+  calendar_event_id text,
   cancelled_now boolean
 )
 language plpgsql
@@ -446,6 +484,74 @@ begin
     start_time := slot_record.start_time;
     end_time := slot_record.end_time;
     location := slot_record.location;
+    calendar_event_id := booking_record.calendar_event_id;
+    cancelled_now := true;
+    return next;
+  end loop;
+end;
+$$;
+
+create or replace function public.cancel_admin_slots_by_ids(slot_ids_input uuid[])
+returns table (
+  slot_id uuid,
+  booking_id uuid,
+  customer_telegram_id bigint,
+  customer_name text,
+  service_date date,
+  start_time time,
+  end_time time,
+  location text,
+  calendar_event_id text,
+  cancelled_now boolean
+)
+language plpgsql
+security definer
+as $$
+declare
+  slot_record public.slots%rowtype;
+  booking_record public.bookings%rowtype;
+begin
+  for slot_record in
+    select s.*
+    from public.slots s
+    where s.id = any(slot_ids_input)
+      and s.status in ('open', 'booked')
+    order by s.service_date, s.start_time
+    for update
+  loop
+    booking_record := null;
+
+    select * into booking_record
+    from public.bookings
+    where bookings.slot_id = slot_record.id
+      and bookings.status = 'booked'
+    order by bookings.created_at desc
+    limit 1
+    for update;
+
+    if found then
+      update public.bookings
+      set status = 'cancelled',
+          updated_at = now()
+      where id = booking_record.id
+        and status = 'booked';
+    end if;
+
+    update public.slots
+    set status = 'cancelled',
+        updated_at = now()
+    where id = slot_record.id
+      and status in ('open', 'booked');
+
+    slot_id := slot_record.id;
+    booking_id := booking_record.id;
+    customer_telegram_id := booking_record.customer_telegram_id;
+    customer_name := booking_record.customer_name;
+    service_date := slot_record.service_date;
+    start_time := slot_record.start_time;
+    end_time := slot_record.end_time;
+    location := slot_record.location;
+    calendar_event_id := booking_record.calendar_event_id;
     cancelled_now := true;
     return next;
   end loop;

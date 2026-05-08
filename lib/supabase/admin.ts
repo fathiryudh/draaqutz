@@ -19,6 +19,27 @@ export type DatabaseBooking = {
   customer_username: string | null;
   customer_name: string;
   status: "booked" | "cancelled" | "completed";
+  calendar_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DatabaseCustomer = {
+  telegram_id: number;
+  username: string | null;
+  display_name: string;
+  loyalty_stamps: number;
+  channel_membership_verified: boolean;
+  channel_membership_verified_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PendingBooking = {
+  customer_telegram_id: number;
+  slot_id: string;
+  chat_id: number;
+  expires_at: string;
   created_at: string;
   updated_at: string;
 };
@@ -32,6 +53,7 @@ export type AdminCancelledSlot = {
   start_time: string;
   end_time: string;
   location: string;
+  calendar_event_id: string | null;
   cancelled_now: boolean;
 };
 
@@ -44,6 +66,7 @@ export type AdminCancelledBooking = {
   start_time: string;
   end_time: string;
   location: string;
+  calendar_event_id: string | null;
   cancelled_now: boolean;
 };
 
@@ -51,6 +74,7 @@ export type CompletedBookingSlot = {
   booking_id: string;
   customer_telegram_id: number;
   customer_name: string;
+  customer_username: string | null;
   service_date: string;
   start_time: string;
   end_time: string;
@@ -66,6 +90,7 @@ export type CustomerCancelledBooking = {
   start_time: string;
   end_time: string;
   location: string;
+  calendar_event_id: string | null;
   cancelled_now: boolean;
 };
 
@@ -78,6 +103,18 @@ export type ChannelPostDraft = {
   service_dates: string[];
   draft_text: string;
   edited: boolean;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SlotDeleteDraft = {
+  id: string;
+  admin_telegram_id: number;
+  chat_id: number;
+  service_date: string;
+  slot_ids: string[];
+  selected_slot_ids: string[];
   expires_at: string;
   created_at: string;
   updated_at: string;

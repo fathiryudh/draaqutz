@@ -33,6 +33,7 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_WEBHOOK_SECRET=
 TELEGRAM_SETUP_SECRET=
 TELEGRAM_CHANNEL_ID=
+TELEGRAM_CHANNEL_URL=https://t.me/draaqutz
 ADMIN_TELEGRAM_IDS=
 ADMIN_TELEGRAM_USERNAMES=
 NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=
@@ -42,6 +43,17 @@ BUSINESS_TIME_ZONE=Asia/Singapore
 For local admin testing, `ADMIN_TELEGRAM_USERNAMES` can be comma-separated usernames without `@`. Add Telegram numeric IDs later when available.
 Set `TELEGRAM_WEBHOOK_SECRET` to a random string and pass it when registering the webhook so Telegram includes it in the `x-telegram-bot-api-secret-token` header.
 Set `TELEGRAM_SETUP_SECRET` to a different random string for the command setup route.
+Set `TELEGRAM_CHANNEL_ID` to the Draaqutz channel id used for membership checks, and keep `TELEGRAM_CHANNEL_URL` as the public join link shown to customers. The bot must be able to inspect channel members; if verification is not configured, customers cannot view or book slots.
+
+Optional Google Calendar sync:
+
+```bash
+GOOGLE_CALENDAR_ID=
+GOOGLE_SERVICE_ACCOUNT_EMAIL=
+GOOGLE_PRIVATE_KEY=
+```
+
+Create a Google Cloud service account, enable the Google Calendar API, then share the target Google Calendar with the service account email using permission to make changes to events. Use that calendar's ID for `GOOGLE_CALENDAR_ID`, the service account email for `GOOGLE_SERVICE_ACCOUNT_EMAIL`, and the private key from the service account JSON for `GOOGLE_PRIVATE_KEY`. When all three values are set, confirmed Telegram bookings are added to Google Calendar and cancelled bookings remove their matching calendar event.
 
 ## Supabase
 
@@ -109,7 +121,9 @@ New slots are inserted first. When the admin is ready, `Post` shows dates that h
 ## Notes
 
 - The website uses real haircut gallery images and placeholder sea salt spray imagery until product photos are available.
-- Bookings are instant holds.
+- Bookings are held after the customer chooses a slot and sends the booking name.
+- Customers must verify they have joined the Draaqutz Telegram channel before viewing or booking slots.
+- Bookings sync to Google Calendar when the Google service account env values are configured.
 - Customers can cancel their own bookings.
 - Customers are notified when an admin cancels their booked slot.
 - An allowed admin marks bookings complete to award one loyalty stamp exactly once.
