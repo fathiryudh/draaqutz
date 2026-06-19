@@ -2196,7 +2196,7 @@ async function fetchScheduleSlotsForDate(date: string) {
     .from("slots")
     .select("*, bookings(*)")
     .eq("service_date", date)
-    .in("status", ["open", "booked"])
+    .in("status", ["open", "booked", "completed"])
     .order("start_time", { ascending: true });
 
   if (error) throw error;
@@ -2228,7 +2228,7 @@ function formatScheduleForDate(date: string, slots: ScheduleSlot[]) {
 
   const locationSections = Array.from(groupSlotsByLocation(slots).entries()).flatMap(([location, locationSlots]) => {
     const rows = locationSlots.map((slot) => {
-      const activeBooking = slot.bookings?.find((booking) => booking.status === "booked");
+      const activeBooking = slot.bookings?.find((booking) => booking.status === "booked" || booking.status === "completed");
       const name = activeBooking?.customer_name.replace(/\s*\(@[^)]+\)$/, "") ?? "";
       return `🕐 ${formatTime(slot.start_time)} – ${formatTime(slot.end_time)} → ${name}`;
     });
